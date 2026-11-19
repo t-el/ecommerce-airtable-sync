@@ -1,0 +1,19 @@
+# n8n end-to-end run (n8n 1.123.98, workflow imported with `n8n import:workflow`, mock Airtable API on :8720)
+# env: AIRTABLE_API_URL=http://127.0.0.1:8720/airtable NODE_FUNCTION_ALLOW_BUILTIN=crypto SHOPIFY_WEBHOOK_SECRET=... GUMROAD_WEBHOOK_TOKEN=...
+
+$ Shopify orders/create #1003 (valid HMAC)
+  -> HTTP 200 {"status":"synced","record_id":"recJAb1d0NzKgvfhI","created":true}
+$ Same webhook delivered again (upsert merges on Order ID, no duplicate row)
+  -> HTTP 200 {"status":"synced","record_id":"recJAb1d0NzKgvfhI","created":false}
+$ Forged webhook (bad HMAC)
+  -> HTTP 401 {"status":"rejected","reason":"invalid signature"}
+$ Gumroad Ping (token ok)
+  -> HTTP 200 {"status":"synced","record_id":"rech7AKHoXeAx3hT2","created":true}
+$ Gumroad Ping (bad token)
+  -> HTTP 401 {"status":"rejected","reason":"invalid token"}
+$ Gumroad Ping in JPY (not an Airtable select option -> 422 after retries -> dead letter + Slack alert)
+  -> HTTP 202 {"status":"dead_lettered","order_key":"gumroad:gS5eV5","error":"Insufficient permissions to create new select option \"\"JPY\"\" in field Currency","payload":{"Order ID":"gumroad:gS5eV5","Source":"Gumroad","Order #":"524005","Email":"haruto.s@example.jp","Cust
+$ Airtable rows written: [('shopify:5512000003', 45.5, 'paid'), ('gumroad:gS4dU4', 99, 'paid')]
+
+# Note: n8n's Retry On Fail retries every error, so the 422 above was tried 5 times (about 20 s) before the error branch ran.
+# The Python service only retries 429/5xx/timeouts and dead-letters a 422 immediately.

@@ -1,0 +1,118 @@
+### 1. Reconciliation BEFORE: what the client's Airtable base looks like today
+# Reconciliation report (2026-11-19T12:07:18Z)
+
+Store orders: **13**, Airtable rows: **7**, matching: **2**
+
+| Check | Count |
+|---|---|
+| Missing in Airtable | 8 |
+| Mismatched | 3 |
+| Duplicate rows | 1 |
+| Orphaned rows (not in store) | 1 |
+
+## Missing in Airtable
+- `gumroad:gS4dU4`
+- `gumroad:gS5eV5`
+- `gumroad:gS6fW6`
+- `gumroad:gS7gX7`
+- `shopify:5512000003`
+- `shopify:5512000004`
+- `shopify:5512000005`
+- `shopify:5512000006`
+
+## Mismatched
+| Order | Field | Store | Airtable |
+|---|---|---|---|
+| `gumroad:gS2bR2` | Gross | 49.0 | 39.0 |
+| `gumroad:gS2bR2` | Net | 49.0 | 39.0 |
+| `gumroad:gS3cT3` | Refunded | 29.0 | 0.0 |
+| `gumroad:gS3cT3` | Net | 0.0 | 29.0 |
+| `gumroad:gS3cT3` | Status | refunded | paid |
+| `shopify:5512000002` | Refunded | 20.0 | 0.0 |
+| `shopify:5512000002` | Net | 60.0 | 80.0 |
+| `shopify:5512000002` | Status | partially_refunded | paid |
+
+## Duplicate rows (review and delete the extra row in Airtable)
+- `shopify:5512000002`: records recB2chris00002a, recB2chris00002b
+
+## Orphaned rows (not found in the store; never deleted automatically)
+- `shopify:5512000999` (record recB9test0000999)
+
+
+### 2. Backfill from Gumroad + Shopify (Shopify page 2 returns 503 twice; another tool bursts the base -> one 429)
+WARNING ecom_sync.airtable: batch rejected, isolating the bad record(s) batch_size=7 error=airtable PATCH HTTP 422: {'error': {'type': 'INVALID_MULTIPLE_CHOICE_OPTIONS', 'message': 'Insufficient permissions to create new select option ""JPY"" in field Currency'}}
+WARNING ecom_sync.airtable: airtable rate limit hit, pausing all requests step=airtable_upsert pause_s=1.0
+WARNING ecom_sync.retry: transient failure, retrying step=airtable_upsert attempt=1 delay_s=0.13 error=airtable HTTP 429
+ERROR   ecom_sync.pipeline: order dead-lettered order_key=gumroad:gS5eV5 step=airtable_upsert dlq_id=1 error=Insufficient permissions to create new select option ""JPY"" in field Currency
+INFO    ecom_sync.pipeline: backfill finished source=gumroad fetched=7 counts={'dead_lettered': 1, 'created': 3, 'updated': 3} duration_ms=2573
+
+gumroad: {'dead_lettered': 1, 'created': 3, 'updated': 3}
+  dead_lettered  gumroad:gS5eV5         Insufficient permissions to create new select option ""JPY"" in field Currency
+  created        gumroad:gS4dU4         
+  created        gumroad:gS6fW6         
+  created        gumroad:gS7gX7         
+  updated        gumroad:gS1aQ1         
+  updated        gumroad:gS2bR2         
+  updated        gumroad:gS3cT3         
+WARNING ecom_sync.retry: transient failure, retrying step=shopify_list_orders attempt=1 delay_s=0.13 error=shopify GET orders.json HTTP 503
+WARNING ecom_sync.retry: transient failure, retrying step=shopify_list_orders attempt=2 delay_s=0.35 error=shopify GET orders.json HTTP 503
+WARNING ecom_sync.airtable: batch rejected, isolating the bad record(s) batch_size=6 error=airtable PATCH HTTP 422: {'error': {'type': 'INVALID_VALUE_FOR_COLUMN', 'message': "Cannot update more than one record with performUpsert: 2 records match Order ID='shopify:5512000002'"}}
+ERROR   ecom_sync.pipeline: order dead-lettered order_key=shopify:5512000002 step=airtable_upsert dlq_id=2 error=Cannot update more than one record with performUpsert: 2 records match Order ID='shopify:5512000002'
+INFO    ecom_sync.pipeline: backfill finished source=shopify fetched=6 counts={'dead_lettered': 1, 'created': 4, 'updated': 1} duration_ms=1830
+
+shopify: {'dead_lettered': 1, 'created': 4, 'updated': 1}
+  dead_lettered  shopify:5512000002     Cannot update more than one record with performUpsert: 2 records match Order ID='shopify:5
+  created        shopify:5512000003     
+  created        shopify:5512000004     
+  created        shopify:5512000005     
+  created        shopify:5512000006     
+  updated        shopify:5512000001     
+
+Airtable requests: 16, 429s received: 1, time spent throttling: 3.7s
+
+### 3. Run it again: idempotent. Good orders cost 0 writes; only the 2 dead-lettered ones are retried
+gumroad: {'unchanged': 6, 'dead_lettered': 1}
+shopify: {'unchanged': 5, 'dead_lettered': 1}
+Airtable requests: 2, 429s received: 0, time spent throttling: 0.2s
+
+### 4. Live webhooks (Shopify HMAC-signed, Gumroad Ping with secret token)
+  Shopify orders/paid #1006 (pending -> paid)                HTTP 200  updated
+    same webhook delivered again (Shopify retries)           HTTP 200  duplicate
+    older 'pending' event arriving late                      HTTP 200  stale
+  Forged Shopify webhook (bad HMAC)                          HTTP 401  invalid HMAC
+  Shopify refunds/create on #1005 (refetches order)          HTTP 200  updated
+  Gumroad refund ping for Sam Patel                          HTTP 200  updated
+  Gumroad ping with wrong token                              HTTP 401  invalid token
+
+### 5. Dead-letter queue (things a human must decide)
+  #1   gumroad:gS5eV5         step=airtable_upsert  attempts=2  Insufficient permissions to create new select option ""JPY"" in field Currency
+  #2   shopify:5512000002     step=airtable_upsert  attempts=2  Cannot update more than one record with performUpsert: 2 records match Order ID='shopify:5512000002'
+
+### 6. Client fixes the base: adds 'JPY' to the Currency field, deletes the duplicate #1002 row. Replay:
+INFO    ecom_sync.pipeline: dead letter replayed dlq_id=1 counts={'created': 1}
+  replay #1: {'created': 1}
+INFO    ecom_sync.pipeline: dead letter replayed dlq_id=2 counts={'updated': 1}
+  replay #2: {'updated': 1}
+Dead-letter queue is empty.
+
+### 7. Reconciliation AFTER
+# Reconciliation report (2026-11-19T12:07:25Z)
+
+Store orders: **13**, Airtable rows: **14**, matching: **13**
+
+| Check | Count |
+|---|---|
+| Missing in Airtable | 0 |
+| Mismatched | 0 |
+| Duplicate rows | 0 |
+| Orphaned rows (not in store) | 1 |
+
+## Orphaned rows (not found in the store; never deleted automatically)
+- `shopify:5512000999` (record recB9test0000999)
+
+
+### 8. Rate-limit check: 25 single-row writes through the client limiter (4.5 req/s)
+  with limiter:    25 requests in 5.3s, 429s received: 0
+  limiter off:     30 requests in 5.0s, 429s received: 5 (all recovered, 0 lost)
+
+Demo complete. Report: data/demo/reports/reconciliation-report.md
