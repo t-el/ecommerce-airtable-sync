@@ -1,0 +1,11 @@
+[project]
+name = "ecommerce-airtable-sync"
+version = "1.0.0"
+description = "Gumroad + Shopify orders and refunds -> Airtable, with webhooks, backfill, rate limiting, idempotent upserts, a dead-letter queue and a reconciliation report."
+authors = [{ name = "Taha Elkarroumy" }]
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning", "ignore:.*httpx2.*"]

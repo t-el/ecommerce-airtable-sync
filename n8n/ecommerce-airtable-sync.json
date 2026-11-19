@@ -1,0 +1,626 @@
+{
+  "name": "Ecommerce orders -> Airtable (Shopify + Gumroad, upsert, dead-letter, nightly reconciliation)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "shopify-orders",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "e439fb41-8f0c-53bc-9bd5-a25bbb6fd589",
+      "name": "Shopify webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        200
+      ],
+      "webhookId": "shopify-orders"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verify X-Shopify-Hmac-Sha256 over the RAW body (needs NODE_FUNCTION_ALLOW_BUILTIN=crypto)\nconst crypto = require('crypto');\nconst item = $input.first();\nconst headers = item.json.headers || {};\nconst raw = await this.helpers.getBinaryDataBuffer(0, 'data');\nconst secret = $env.SHOPIFY_WEBHOOK_SECRET || '';\nconst expected = crypto.createHmac('sha256', secret).update(raw).digest('base64');\nconst given = headers['x-shopify-hmac-sha256'] || '';\nconst valid = secret.length > 0 && given.length === expected.length &&\n  crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected));\nreturn [{ json: { valid, topic: headers['x-shopify-topic'] || '', webhookId: headers['x-shopify-webhook-id'] || '',\n                  order: JSON.parse(raw.toString('utf8')) } }];"
+      },
+      "id": "f01ac836-7519-584a-8351-04f988e39022",
+      "name": "Verify Shopify HMAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9d65b7a4-4848-5ece-a0dc-122fee90a1aa",
+      "name": "HMAC valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Same mapping as ecom_sync/normalize.py (from_shopify)\nconst STATUS = { paid: 'paid', partially_refunded: 'partially_refunded', refunded: 'refunded', pending: 'pending',\n                 authorized: 'pending', voided: 'cancelled', partially_paid: 'pending' };\nconst o = $input.first().json.order;\nconst email = (o.email || o.contact_email || '').trim().toLowerCase();\nif (!o.id || !email.includes('@')) throw new Error(`shopify order ${o.id}: missing id or email`);\nconst items = o.line_items || [];\nconst refunded = (o.refunds || []).flatMap(r => r.transactions || [])\n  .filter(t => (t.kind || 'refund') === 'refund').reduce((s, t) => s + Number(t.amount || 0), 0);\nconst gross = Number(o.total_price || 0);\nconst c = o.customer || {};\nreturn [{ json: { fields: {\n  'Order ID': `shopify:${o.id}`, 'Source': 'Shopify', 'Order #': o.name || String(o.id), 'Email': email,\n  'Customer': [c.first_name, c.last_name].filter(Boolean).join(' '),\n  'Products': items.map(i => `${i.title} x${i.quantity || 1}`).join(', '),\n  'Qty': items.reduce((s, i) => s + Number(i.quantity || 1), 0) || 1,\n  'Currency': (o.currency || 'USD').toUpperCase(), 'Gross': gross, 'Refunded': Math.round(refunded * 100) / 100,\n  'Net': Math.round((gross - refunded) * 100) / 100, 'Status': STATUS[o.financial_status] || 'pending',\n  'Ordered At': o.created_at } } }];"
+      },
+      "id": "80c520d6-42da-5a04-bb10-76692b389e35",
+      "name": "Normalize Shopify order",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        120
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'rejected', reason: 'invalid signature' } }}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "id": "22a9bc79-ed49-5bde-9f89-3443f96a4f08",
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        660,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "gumroad-ping",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "66fe566a-f466-52b0-b38a-6d8fff5ce472",
+      "name": "Gumroad Ping",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        560
+      ],
+      "webhookId": "gumroad-ping"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.query.token }}",
+              "rightValue": "={{ $env.GUMROAD_WEBHOOK_TOKEN }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d603323f-6d9b-5ac1-bc09-dd1e0c802bbb",
+      "name": "Token valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Same mapping as ecom_sync/normalize.py (from_gumroad). Gumroad sends cents, as strings.\nconst s = $input.first().json.body;\nconst email = (s.email || '').trim().toLowerCase();\nif (!s.sale_id || !email.includes('@')) throw new Error(`gumroad sale ${s.sale_id}: missing id or email`);\nconst gross = Number(s.price || 0) / 100;\nconst refunded = s.refunded === 'true' || s.disputed === 'true';\nreturn [{ json: { fields: {\n  'Order ID': `gumroad:${s.sale_id}`, 'Source': 'Gumroad', 'Order #': String(s.order_number || s.sale_id),\n  'Email': email, 'Customer': s.full_name || '', 'Products': s.product_name || '', 'Qty': Number(s.quantity || 1),\n  'Currency': (s.currency || 'usd').toUpperCase(), 'Gross': gross, 'Refunded': refunded ? gross : 0,\n  'Net': refunded ? 0 : gross, 'Status': s.disputed === 'true' ? 'chargeback' : (refunded ? 'refunded' : 'paid'),\n  'Ordered At': s.sale_timestamp } } }];"
+      },
+      "id": "f3c15168-af21-598c-a7be-93e5d09eb268",
+      "name": "Normalize Gumroad sale",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        480
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'rejected', reason: 'invalid token' } }}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "id": "35256013-4035-58fe-91bb-94d2d04ad872",
+      "name": "Respond 401 (Gumroad)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        660
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ ($env.AIRTABLE_API_URL || 'https://api.airtable.com') + '/v0/' + $env.AIRTABLE_BASE_ID + '/' + encodeURIComponent($env.AIRTABLE_TABLE || 'Orders') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.AIRTABLE_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ performUpsert: { fieldsToMergeOn: ['Order ID'] }, typecast: false, records: [ { fields: $json.fields } ] }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "aecd753c-d6d9-5313-8b31-7620894656d4",
+      "name": "Upsert to Airtable (merge on Order ID)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'synced', record_id: $json.records[0].id, created: ($json.createdRecords || []).length > 0 } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "b0bef31a-b55f-5bc6-8094-d3440d6e22eb",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1140,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The upsert failed after n8n's retries: keep the full payload so it can be replayed.\nconst failed = $('Normalize Shopify order').isExecuted ? $('Normalize Shopify order').first().json\n             : $('Normalize Gumroad sale').first().json;\nconst e = $input.first().json.error || $input.first().json;\nconst raw = String((e && (e.message || e.description)) || JSON.stringify(e)).replace(/\\\\/g, '');\nconst m = raw.match(/\"message\":\"(.+?)\"}/);   // pull Airtable's own error message out of n8n's wrapper\nreturn [{ json: { status: 'dead_lettered', order_key: failed.fields['Order ID'],\n  error: (m ? m[1] : raw).slice(0, 300), payload: failed.fields,\n  failed_at: new Date().toISOString() } }];"
+      },
+      "id": "631ba3d2-4dad-550e-bddc-35eddeb7f7ac",
+      "name": "Build dead letter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL || (($env.SYNC_API_URL || 'http://127.0.0.1:8711') + '/health') }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':rotating_light: Order sync failed for ' + $json.order_key + ': ' + $json.error }) }}",
+        "options": {}
+      },
+      "id": "362d81aa-c860-5b7c-8f8d-a5e227fd1e7d",
+      "name": "Alert Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1360,
+        400
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $('Build dead letter').first().json }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "f3f6ce07-4f91-5fd3-a770-87668789ff99",
+      "name": "Respond 202 (dead-lettered)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1580,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'invalid', error: $json.error } }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "078bca03-be7e-5f74-b504-6c68d7dfae7a",
+      "name": "Bad payload",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        900,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      },
+      "id": "5afe40ea-8be1-5e26-842d-a44a19bf99d9",
+      "name": "Nightly 02:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.SYNC_API_URL || 'http://127.0.0.1:8711') + '/backfill?source=all' }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "10d5cd3a-c90e-5449-a439-cb29a353eacd",
+      "name": "Backfill missed orders",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        900
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ ($env.SYNC_API_URL || 'http://127.0.0.1:8711') + '/reconcile?fix=true' }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "62a8eb7e-c2b9-5c4d-9109-2e7cc2107d98",
+      "name": "Reconcile + fix",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        900
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c3",
+              "leftValue": "={{ Object.keys($json.duplicates).length + Object.keys($json.orphaned).length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "3da78617-5623-58d6-965d-a74a7550787a",
+      "name": "Needs a human?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL || (($env.SYNC_API_URL || 'http://127.0.0.1:8711') + '/health') }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: `:mag: Order reconciliation: ${$json.matched} OK, fixed ${JSON.stringify($json.fixed)}, ${Object.keys($json.duplicates).length} duplicate rows and ${Object.keys($json.orphaned).length} orphaned rows need review.` }) }}",
+        "options": {}
+      },
+      "id": "d629401d-735e-5f8d-a096-835435533564",
+      "name": "Post reconciliation summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        860
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## Ecommerce -> Airtable sync\n**Env:** AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE, SHOPIFY_WEBHOOK_SECRET, GUMROAD_WEBHOOK_TOKEN, SLACK_WEBHOOK_URL, SYNC_API_URL (Python service, for nightly backfill + reconciliation).\n`NODE_FUNCTION_ALLOW_BUILTIN=crypto` for the HMAC check.\n\nUpsert merges on **Order ID**, so Shopify/Gumroad retries never create duplicates. Upsert retries 5x (5 s apart) on 429/5xx; anything still failing is alerted with its payload.",
+        "height": 260,
+        "width": 560
+      },
+      "id": "a824e68e-dc01-582b-9e7c-a44bdf59f499",
+      "name": "Sticky: setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -160
+      ]
+    }
+  ],
+  "connections": {
+    "Shopify webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Shopify HMAC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Shopify HMAC": {
+      "main": [
+        [
+          {
+            "node": "HMAC valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HMAC valid?": {
+      "main": [
+        [
+          {
+            "node": "Normalize Shopify order",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 401",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Shopify order": {
+      "main": [
+        [
+          {
+            "node": "Upsert to Airtable (merge on Order ID)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Bad payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gumroad Ping": {
+      "main": [
+        [
+          {
+            "node": "Token valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Token valid?": {
+      "main": [
+        [
+          {
+            "node": "Normalize Gumroad sale",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 401 (Gumroad)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Gumroad sale": {
+      "main": [
+        [
+          {
+            "node": "Upsert to Airtable (merge on Order ID)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Bad payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert to Airtable (merge on Order ID)": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build dead letter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build dead letter": {
+      "main": [
+        [
+          {
+            "node": "Alert Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Slack": {
+      "main": [
+        [
+          {
+            "node": "Respond 202 (dead-lettered)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nightly 02:00": {
+      "main": [
+        [
+          {
+            "node": "Backfill missed orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backfill missed orders": {
+      "main": [
+        [
+          {
+            "node": "Reconcile + fix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reconcile + fix": {
+      "main": [
+        [
+          {
+            "node": "Needs a human?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs a human?": {
+      "main": [
+        [
+          {
+            "node": "Post reconciliation summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all"
+  },
+  "pinData": {},
+  "id": "ecomAirtableSync01",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
